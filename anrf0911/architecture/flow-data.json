@@ -1,0 +1,585 @@
+{
+  "title": "客服服务 · 函数级调用图",
+  "subtitle": "蓝色=已实现。橙色虚线=Day04 待敲。Day03 只收消息并留下 COLLECTING；Day04 由后台 Worker 领取、调 AI :8002、把回复写入 messages。消息接口仍然立刻返回，不等模型。",
+  "flows": [
+    {
+      "id": "get-current-conversation",
+      "name": "获取当前会话（Day02）",
+      "method": "POST",
+      "path": "/api/v1/conversations/current",
+      "allowedRoles": ["customer"],
+      "response": "CurrentConversationResponse { id, mode, is_processing }",
+      "steps": [
+        {
+          "fn": "router.get_current_conversation",
+          "layer": "路由",
+          "title": "1. 接到 POST /conversations/current",
+          "do": "从 Header 取出 Authorization，调用 AuthService.get_authorized_user(..., \"customer\")。不是顾客 → 401/403，流程结束。",
+          "then": "通过后，拿出 user_id，进入会话服务"
+        },
+        {
+          "fn": "conv.get_current_conversation",
+          "layer": "会话服务",
+          "title": "2. ConversationService.get_current_conversation(user_id)",
+          "do": "这是业务入口。它自己不查 SQL，先调用 ensure_activate_conversation。",
+          "then": "先去第 3 步把会话准备好，再回到这里 commit"
+        },
+        {
+          "fn": "conv.ensure_activate_conversation",
+          "layer": "会话服务",
+          "title": "3. ensure_activate_conversation(user_id)",
+          "do": "按固定顺序：①关超时 AI 会话 ②查 AI/QUEUED/HUMAN ③没有就新建。不 commit。",
+          "then": "内部会调仓储；完成后把 Conversation 对象交回第 2 步"
+        },
+        {
+          "fn": "conv.get_current_conversation",
+          "layer": "会话服务",
+          "title": "4. 回到 get_current_conversation：commit + 返回",
+          "do": "await session.commit()，再返回 {id, mode, is_processing}。",
+          "then": "路由把 JSON 交给前端，流程结束"
+        }
+      ]
+    },
+    {
+      "id": "get-conversation-detail",
+      "name": "会话详情（Day02）",
+      "method": "GET",
+      "path": "/api/v1/conversations/{id}",
+      "allowedRoles": ["agent", "admin"],
+      "response": "ConversationDetailResponse { messages }",
+      "steps": [
+        {
+          "fn": "router.get_conversation_detail",
+          "layer": "路由",
+          "title": "1. 接到 GET /conversations/{id}",
+          "do": "路径里取出 conversation_id。验 agent 或 admin。顾客 token → 403。",
+          "then": "进入会话服务 get_conversation_detail"
+        },
+        {
+          "fn": "conv.get_conversation_detail",
+          "layer": "会话服务",
+          "title": "2. ConversationService.get_conversation_detail(id)",
+          "do": "先按主键确认会话在不在。不在 → 404。不关超时、不新建。",
+          "then": "先调会话仓储，再调消息仓储"
+        },
+        {
+          "fn": "repo_conv.get_conversation",
+          "layer": "会话仓储",
+          "title": "3. ConversationRepository.get_conversation(id)",
+          "do": "session.get(Conversation, id)。有行返回对象，没有返回 None。",
+          "then": "回到第 2 步；None 就 404，有对象再拉消息"
+        },
+        {
+          "fn": "repo_msg.get_conversation_messages",
+          "layer": "消息仓储",
+          "title": "4. MessageRepository.get_conversation_messages(id)",
+          "do": "SELECT messages WHERE conversation_id=? ORDER BY id 升序。",
+          "then": "服务抽出 4 个字段，路由返回 {messages:[...]}"
+        }
+      ]
+    },
+    {
+      "id": "accept-user-message",
+      "name": "接收用户消息（Day03）",
+      "method": "POST",
+      "path": "/api/v1/chat/messages",
+      "allowedRoles": ["customer"],
+      "response": "AcceptUserMessageResponse { conversation_id, mode }",
+      "steps": [
+        {
+          "fn": "router.accept_user_message",
+          "layer": "路由",
+          "title": "1. 接到 POST /chat/messages",
+          "do": "Body 校验成 ChatMessageRequest。验 customer。路由不写 SQL。",
+          "then": "把 user_id + chat_message 交给 ChatMessageService"
+        },
+        {
+          "fn": "msg.accept_user_message",
+          "layer": "消息服务",
+          "title": "2. ChatMessageService.accept_user_message（总入口）",
+          "do": "整单事务从这里开始，也只在这里 commit。先查这条 message_id 有没有存过。",
+          "then": "去第 3 步查重复"
+        },
+        {
+          "fn": "repo_msg.find_with_conversation_by_message_id",
+          "layer": "消息仓储",
+          "title": "3. 按 message_id 联表查询",
+          "do": "消息 JOIN 会话。查到了 = 重复提交，直接返回原 conversation_id/mode，后面步骤全跳过。",
+          "then": "没有记录 → 第 4 步锁会话；有记录 → 结束"
+        },
+        {
+          "fn": "conv.ensure_locked_active_conversation",
+          "layer": "会话服务",
+          "title": "4. 会话服务：拿到并锁住当前会话",
+          "do": "先 ensure_activate_conversation（关超时/新建），再 FOR UPDATE 锁这一行。消息服务自己不关超时。",
+          "then": "回到消息服务，拿着 Conversation 去存消息"
+        },
+        {
+          "fn": "msg.add_message",
+          "layer": "消息服务",
+          "title": "5. add_message：造一条用户消息",
+          "do": "role 固定 user。刷新 last_active_at。不加 input_revision，不 commit。",
+          "then": "第 6 步只是登记到 session"
+        },
+        {
+          "fn": "repo_msg.add",
+          "layer": "消息仓储",
+          "title": "6. MessageRepository.add",
+          "do": "session.add(message)，内存标记待插入。",
+          "then": "若 mode=AI → 第 7 步；人工/排队今天先不写"
+        },
+        {
+          "fn": "turn.add_message_to_turn",
+          "layer": "轮次服务",
+          "title": "7. TurnService.add_message_to_turn",
+          "do": "input_revision += 1，写到这条消息上。再查有没有 COLLECTING 轮次。",
+          "then": "有收集轮次 → 第 8 步延长；没有 → 第 9 步新建"
+        },
+        {
+          "fn": "repo_turn.find_and_lock_collecting",
+          "layer": "轮次仓储",
+          "title": "8. 锁定当前 COLLECTING 轮次（如果有）",
+          "do": "SELECT ... WHERE status='COLLECTING' FOR UPDATE。查到就把 collect_until 往后推（不超过 max）。",
+          "then": "查不到 → 第 9 步；查到 → 跳到第 10 步提交"
+        },
+        {
+          "fn": "repo_turn.add",
+          "layer": "轮次仓储",
+          "title": "9. 没有收集轮次：新建一条 COLLECTING",
+          "do": "ConversationTurn(start_revision=已回答版本+1, collect_until=现在+1.5秒)。不调 AI。",
+          "then": "回到消息服务总入口提交"
+        },
+        {
+          "fn": "infra.commit",
+          "layer": "消息服务",
+          "title": "10. accept_user_message 末尾 commit",
+          "do": "消息 + 会话版本 + 轮次 同一事务提交。任一步失败全部回滚。",
+          "then": "返回 {conversation_id, mode}，流程结束。AI 回复不在这一枪里。"
+        }
+      ]
+    },
+    {
+      "id": "ai-worker-claim-and-save",
+      "name": "领取轮次并保存 AI 回复（Day04）",
+      "method": "WORKER",
+      "path": "后台循环（无 HTTP）",
+      "allowedRoles": ["内部进程"],
+      "response": "Turn: COLLECTING → RUNNING → COMPLETED；messages 多一条 role=ai",
+      "steps": [
+        {
+          "fn": "worker.poll_and_process",
+          "layer": "后台 Worker",
+          "title": "1. 死循环：先回收过期租约，再领一个任务",
+          "do": "不是接口。进程里一直跑。没任务就睡一小会儿，避免空转打库。",
+          "then": "去第 2 步找到期的 COLLECTING"
+        },
+        {
+          "fn": "repo_turn.find_claimable",
+          "layer": "轮次仓储",
+          "title": "2. 哪些轮次能领",
+          "do": "status=COLLECTING 且 collect_until 已到 且 会话仍是 AI 且 同一会话没有 RUNNING。FOR UPDATE 锁这一行。",
+          "then": "领到 → 第 3 步改状态；领不到 → 睡觉再回到第 1 步"
+        },
+        {
+          "fn": "turn.claim_turn",
+          "layer": "轮次服务",
+          "title": "3. 短事务领取：改 RUNNING，钉死快照，写租约",
+          "do": "snapshot_revision=当前 input_revision（本轮只答到这里）。locked_by/locked_until 表示这个进程暂时拥有处理权。commit 后放行锁。",
+          "then": "关 Session，去第 4 步拼请求。调 AI 时不再占着数据库连接"
+        },
+        {
+          "fn": "turn.build_agent_request",
+          "layer": "轮次服务",
+          "title": "4. 拼给 AI 的包：本轮用户话 + 最近 30 条历史",
+          "do": "messages=本轮 start～snapshot 的 user 消息。history=这之前的上下文。request_id=turnId:attempt:次数。",
+          "then": "交给单轮处理器去调 8002"
+        },
+        {
+          "fn": "processor.process_turn",
+          "layer": "单轮处理器",
+          "title": "5. TurnProcessor：办完这一轮（Worker 不管模型细节）",
+          "do": "造一个代表该顾客的 JWT，再调网关。普通回复今天走完就能结算；改订单那种两阶段先跳过。",
+          "then": "第 6 步 HTTP 调 AI"
+        },
+        {
+          "fn": "gateway.start_run",
+          "layer": "AI 网关",
+          "title": "6. POST AI :8002 /internal/v1/agent/runs",
+          "do": "Authorization=顾客 token；X-Internal-Service-Token=客服服务自己的内部令牌。客服服务不跑模型，只当传话。",
+          "then": "第 7 步看返回的 event_type"
+        },
+        {
+          "fn": "parser.parse_event",
+          "layer": "事件解析",
+          "title": "7. 认出是普通完成 / 失败（转人工、写订单先跳过）",
+          "do": "run_completed → 里面有回复文本和 run_id。run_failed → 走重试。",
+          "then": "第 8 步再开一条短事务存结果"
+        },
+        {
+          "fn": "result.save_ai_reply",
+          "layer": "结果服务",
+          "title": "8. 存 AI 消息，推进 answered_revision，Turn=COMPLETED",
+          "do": "再锁会话核对：input_revision 还等于快照才保存。不相等 → SUPERSEDED，丢掉旧回复（用户又发了新话）。",
+          "then": "commit。用户今天用详情接口能看到；WebSocket 推送仍未做"
+        }
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "id": "schema",
+      "level": "第2章",
+      "name": "请求 / 响应模型",
+      "file": "app/schemas/conversation.py",
+      "color": "#22d3ee",
+      "functions": [
+        {
+          "id": "schema.CurrentConversationResponse",
+          "name": "CurrentConversationResponse",
+          "signature": "id, mode, is_processing",
+          "does": "已实现。当前会话接口用。",
+          "calls": []
+        },
+        {
+          "id": "schema.ChatMessageRequest",
+          "name": "ChatMessageRequest",
+          "signature": "message_id: str, type: str, content: dict[str, Any]",
+          "does": "第2章。前端提交的一条消息。message_id 由前端生成，重试时必须相同。",
+          "calls": []
+        },
+        {
+          "id": "schema.AcceptUserMessageResponse",
+          "name": "AcceptUserMessageResponse",
+          "signature": "conversation_id: str, mode: str",
+          "does": "第2章。发完只告诉前端：进了哪个会话、现在 AI 还是人工。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "repo_msg",
+      "level": "第3章",
+      "name": "消息仓储（只查/登记消息，不提交）",
+      "file": "app/repositories/messages.py",
+      "color": "#f59e0b",
+      "functions": [
+        {
+          "id": "repo_msg.get_conversation_messages",
+          "name": "get_conversation_messages",
+          "signature": "async def get_conversation_messages(conversation_id)",
+          "does": "已实现。详情接口用。",
+          "calls": []
+        },
+        {
+          "id": "repo_msg.find_with_conversation_by_message_id",
+          "name": "find_with_conversation_by_message_id",
+          "signature": "async def find_with_conversation_by_message_id(message_id) -> (Message, Conversation) | None",
+          "does": "第3章。消息 JOIN 会话。查到了说明提交过，不再 insert。",
+          "calls": []
+        },
+        {
+          "id": "repo_msg.add",
+          "name": "add",
+          "signature": "def add(message) -> None",
+          "does": "第5章才会用到。session.add，同步，不 commit。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "conv",
+      "level": "第4章",
+      "name": "会话服务（只管会话，不管存消息）",
+      "file": "app/services/chat/conversation.py",
+      "color": "#34d399",
+      "functions": [
+        {
+          "id": "conv.get_current_conversation",
+          "name": "get_current_conversation",
+          "kind": "entry",
+          "signature": "async def get_current_conversation(user_id)",
+          "does": "已实现。打开客服页。",
+          "calls": ["conv.ensure_activate_conversation"]
+        },
+        {
+          "id": "conv.ensure_activate_conversation",
+          "name": "ensure_activate_conversation",
+          "signature": "async def ensure_activate_conversation(user_id) -> Conversation",
+          "does": "已实现。关超时、查有效、没有就新建。发消息会复用。",
+          "calls": []
+        },
+        {
+          "id": "conv.get_conversation_detail",
+          "name": "get_conversation_detail",
+          "signature": "async def get_conversation_detail(conversation_id)",
+          "does": "已实现。客服看历史。这里只读消息，不是「接收新消息」。",
+          "calls": ["repo_conv.get_conversation", "repo_msg.get_conversation_messages"]
+        },
+        {
+          "id": "conv.ensure_locked_active_conversation",
+          "name": "ensure_locked_active_conversation",
+          "signature": "async def ensure_locked_active_conversation(user_id) -> Conversation",
+          "does": "第4章。先 ensure_activate_conversation，再 refresh(..., with_for_update=True)。两个人同时发消息时，第二次要等第一次改完 input_revision。",
+          "calls": ["conv.ensure_activate_conversation"]
+        }
+      ]
+    },
+    {
+      "id": "repo_conv",
+      "level": "Day02",
+      "name": "会话仓储",
+      "file": "app/repositories/conversation.py",
+      "color": "#fbbf24",
+      "functions": [
+        {
+          "id": "repo_conv.get_conversation",
+          "name": "get_conversation",
+          "signature": "async def get_conversation(conversation_id)",
+          "does": "已实现。按主键取一行。和 get_current_conversation 不是一回事。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "msg",
+      "level": "第5+9章",
+      "name": "消息服务（只管收消息，不管关超时）",
+      "file": "app/services/chat/message.py",
+      "color": "#4ade80",
+      "functions": [
+        {
+          "id": "msg.add_message",
+          "name": "add_message",
+          "signature": "def add_message(conversation, role, content, message_id, message_type) -> Message",
+          "does": "第5章。造 Message，交给消息仓储 add，刷新 last_active_at。不 flush、不 commit、不加 input_revision。",
+          "calls": ["repo_msg.add"]
+        },
+        {
+          "id": "msg.accept_user_message",
+          "name": "accept_user_message",
+          "signature": "async def accept_user_message(user_id, chat_message) -> dict",
+          "does": "第9章总入口。查重复 → 调会话服务加锁 → add_message → AI 则调轮次服务 → commit。",
+          "calls": [
+            "repo_msg.find_with_conversation_by_message_id",
+            "conv.ensure_locked_active_conversation",
+            "msg.add_message",
+            "turn.add_message_to_turn"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "turn",
+      "level": "第6章",
+      "name": "轮次服务",
+      "file": "app/services/chat/turn.py",
+      "color": "#a3e635",
+      "functions": [
+        {
+          "id": "turn.add_message_to_turn",
+          "name": "add_message_to_turn",
+          "signature": "async def add_message_to_turn(conversation, message)",
+          "does": "Day03 已实现。版本+1；有 COLLECTING 就延长，没有就新建。不调 AI。",
+          "calls": ["repo_turn.find_and_lock_collecting", "repo_turn.add"]
+        },
+        {
+          "id": "turn.claim_turn",
+          "name": "claim_turn",
+          "kind": "todo",
+          "signature": "async def claim_turn() -> Turn | None",
+          "does": "Day04。把到期 COLLECTING 改成 RUNNING，钉 snapshot_revision，写租约后立刻 commit。",
+          "calls": ["repo_turn.find_claimable"]
+        },
+        {
+          "id": "turn.build_agent_request",
+          "name": "build_agent_request",
+          "kind": "todo",
+          "signature": "async def build_agent_request(turn) -> (payload, last_user_message_id)",
+          "does": "Day04。messages=本轮未答用户话；history=之前约 30 条。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "repo_turn",
+      "level": "第6章",
+      "name": "轮次仓储",
+      "file": "app/repositories/turn.py",
+      "color": "#eab308",
+      "functions": [
+        {
+          "id": "repo_turn.find_and_lock_collecting",
+          "name": "find_and_lock_collecting",
+          "signature": "async def find_and_lock_collecting(conversation_id) -> ConversationTurn | None",
+          "does": "第6章。status=COLLECTING，with_for_update。有就延长，没有才新建。",
+          "calls": []
+        },
+        {
+          "id": "repo_turn.add",
+          "name": "add",
+          "signature": "def add(turn) -> None",
+          "does": "Day03 已实现。session.add，同步。",
+          "calls": []
+        },
+        {
+          "id": "repo_turn.find_claimable",
+          "name": "find_claimable",
+          "kind": "todo",
+          "signature": "async def find_claimable() -> ConversationTurn | None",
+          "does": "Day04。到期 COLLECTING + 会话仍 AI + 同会话没有 RUNNING。with_for_update。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "router",
+      "level": "第9章",
+      "name": "路由",
+      "file": "app/routers/chat/conversation.py  ·  app/routers/chat/messages.py",
+      "color": "#a78bfa",
+      "functions": [
+        {
+          "id": "router.get_current_conversation",
+          "name": "get_current_conversation",
+          "kind": "http",
+          "signature": "POST /conversations/current",
+          "does": "已实现。调会话服务。",
+          "calls": ["conv.get_current_conversation"]
+        },
+        {
+          "id": "router.get_conversation_detail",
+          "name": "get_conversation_detail",
+          "kind": "http",
+          "signature": "GET /conversations/{id}",
+          "does": "已实现。调会话服务。",
+          "calls": ["conv.get_conversation_detail"]
+        },
+        {
+          "id": "router.accept_user_message",
+          "name": "accept_user_message",
+          "kind": "http",
+          "signature": "POST /api/v1/chat/messages",
+          "does": "Day03 已实现。验 customer，调 ChatMessageService。",
+          "calls": ["msg.accept_user_message"]
+        }
+      ]
+    },
+    {
+      "id": "dep",
+      "level": "第9章",
+      "name": "依赖注入（同一条 session）",
+      "file": "app/dependencies.py",
+      "color": "#818cf8",
+      "functions": [
+        {
+          "id": "dep.get_chat_message_service",
+          "name": "get_chat_message_service",
+          "signature": "session + ConversationService + TurnService → ChatMessageService",
+          "does": "第9章。四个对象必须共用 get_db 拿到的那条 session，否则消息和轮次不在同一事务。",
+          "calls": ["msg.accept_user_message"]
+        }
+      ]
+    },
+    {
+      "id": "infra",
+      "level": "第9章",
+      "name": "提交",
+      "file": "app/infrastructure/db.py",
+      "color": "#fb7185",
+      "functions": [
+        {
+          "id": "infra.commit",
+          "name": "session.commit",
+          "signature": "await session.commit()",
+          "does": "Day03：消息服务末尾 commit。Day04：领取一次、结算一次，两次都是短事务；调 AI 时不占连接。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "worker",
+      "level": "Day04",
+      "name": "后台 Worker（什么时候处理）",
+      "file": "app/workers/ai_worker.py 【新建】",
+      "color": "#38bdf8",
+      "functions": [
+        {
+          "id": "worker.poll_and_process",
+          "name": "poll_and_process",
+          "kind": "todo",
+          "signature": "async def poll_and_process()",
+          "does": "回收过期租约 → 领一个 Turn → 交给 Processor。没活就 sleep。不是 HTTP。",
+          "calls": ["turn.claim_turn", "processor.process_turn"]
+        }
+      ]
+    },
+    {
+      "id": "processor",
+      "level": "Day04",
+      "name": "单轮处理器（怎么处理完一轮）",
+      "file": "app/workers/turn_processor.py 【新建】",
+      "color": "#818cf8",
+      "functions": [
+        {
+          "id": "processor.process_turn",
+          "name": "process_turn",
+          "kind": "todo",
+          "signature": "async def process_turn(turn, request)",
+          "does": "造用户 JWT → 调网关 → 解析事件 → 结算。Worker 不写这段细节。",
+          "calls": ["gateway.start_run", "parser.parse_event", "result.save_ai_reply"]
+        }
+      ]
+    },
+    {
+      "id": "gateway",
+      "level": "Day04",
+      "name": "AI 网关",
+      "file": "app/services/ai_gateway.py 【新建】",
+      "color": "#c084fc",
+      "functions": [
+        {
+          "id": "gateway.start_run",
+          "name": "start_run",
+          "kind": "todo",
+          "signature": "async def start_run(payload, user_token) -> dict",
+          "does": "HTTP 调 8002。两把钥匙：顾客 token + 内部服务 token。客服服务不跑模型。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "parser",
+      "level": "Day04",
+      "name": "事件解析",
+      "file": "app/services/ai_event_parser.py 【新建】",
+      "color": "#e879f9",
+      "functions": [
+        {
+          "id": "parser.parse_event",
+          "name": "parse_event",
+          "kind": "todo",
+          "signature": "def parse_event(body) -> 完成 | 失败",
+          "does": "只认一个 JSON。今天先处理 run_completed / run_failed。写订单两阶段、转人工跳过。",
+          "calls": []
+        }
+      ]
+    },
+    {
+      "id": "result",
+      "level": "Day04",
+      "name": "结果保存",
+      "file": "app/services/ai_result.py 【新建】",
+      "color": "#34d399",
+      "functions": [
+        {
+          "id": "result.save_ai_reply",
+          "name": "save_ai_reply",
+          "kind": "todo",
+          "signature": "async def save_ai_reply(turn, event)",
+          "does": "快照仍有效才 insert role=ai，answered_revision=快照，Turn=COMPLETED。过期则 SUPERSEDED。",
+          "calls": ["repo_msg.add"]
+        }
+      ]
+    }
+  ]
+}

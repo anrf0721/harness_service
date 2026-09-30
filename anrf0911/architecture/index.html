@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>客服服务 · 函数级调用图</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #121a2b;
+      --line: #243049;
+      --text: #e8eefc;
+      --muted: #93a0b8;
+      --reject: #fb7185;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body { padding: 20px 24px 40px; }
+    .top { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+    h1 { margin: 0 0 6px; font-size: 26px; }
+    .sub { color: var(--muted); max-width: 820px; line-height: 1.55; font-size: 14px; }
+    .hint { font-size: 12px; color: #cbd5e1; background: #1b263b; border: 1px solid var(--line); padding: 8px 12px; border-radius: 8px; height: fit-content; }
+    .layout { display: grid; grid-template-columns: minmax(360px, 440px) 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; }
+    .flows { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    .flow-btn { border: 1px solid var(--line); background: #172033; color: var(--text); border-radius: 999px; padding: 8px 14px; cursor: pointer; }
+    .flow-btn.active { background: #2563eb; border-color: #3b82f6; }
+    .meta { display: grid; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+    .meta b { color: var(--muted); font-size: 11px; display: block; margin-bottom: 2px; }
+    .steps { padding: 10px 8px 14px; max-height: calc(100vh - 220px); overflow: auto; }
+    .step { display: grid; grid-template-columns: 28px 1fr; gap: 8px; padding: 10px 8px; border-radius: 8px; cursor: pointer; border-bottom: 1px solid #1e293b; }
+    .step:hover, .step.active { background: #182338; }
+    .step.reject { outline: 1px solid #7f1d1d; }
+    .num { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: #1d4ed8; font-size: 11px; margin-top: 2px; }
+    .step-layer { font-size: 11px; color: #fbbf24; margin-bottom: 2px; }
+    .step-title { color: var(--text); font-size: 13px; font-weight: 600; line-height: 1.35; }
+    .step-fn { color: #7dd3fc; font-size: 11px; font-family: Consolas, "Courier New", monospace; margin: 4px 0; }
+    .step-do { color: #cbd5e1; font-size: 12px; line-height: 1.45; }
+    .step-then { color: #86efac; font-size: 12px; line-height: 1.4; margin-top: 4px; }
+    .modules { display: grid; gap: 12px; }
+    .mod { overflow: hidden; }
+    .mod-head { display: flex; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+    .mod-title { font-weight: 700; }
+    .mod-file { color: #cbd5e1; font-size: 12px; }
+    .fns { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; padding: 12px; }
+    .fn { background: #0f172a; border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+    .fn.active { outline: 2px solid #60a5fa; background: #10233f; }
+    .fn.entry { border-color: #2563eb; }
+    .fn.http { border-color: #7c3aed; }
+    .fn.todo { border: 1px dashed #f59e0b; background: #1a1408; }
+    .fn.todo .fn-name::after { content: " 待敲"; color: #fbbf24; font-size: 11px; font-family: inherit; }
+    .fn-name { margin: 0 0 6px; font-size: 14px; font-family: Consolas, "Courier New", monospace; }
+    .sig { color: #7dd3fc; font-size: 11px; line-height: 1.4; margin-bottom: 8px; word-break: break-all; }
+    .does { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .calls { margin: 8px 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 4px; }
+    .calls li { font-size: 11px; background: #1e293b; color: #dbeafe; border-radius: 999px; padding: 2px 8px; font-family: Consolas, monospace; }
+    .how { margin-top: 14px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    code { color: #93c5fd; }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <h1 id="title">函数级调用图</h1>
+      <div class="sub" id="subtitle"></div>
+    </div>
+    <div class="hint">http://127.0.0.1:8000/architecture/</div>
+  </div>
+  <div class="flows" id="flows"></div>
+  <div class="layout">
+    <aside class="panel">
+      <div class="meta" id="meta"></div>
+      <div class="steps" id="steps"></div>
+    </aside>
+    <main class="modules" id="modules"></main>
+  </div>
+  <p class="how">
+    新增逻辑时改 <code>anrf0911/architecture/flow-data.json</code>：
+    在对应 <code>modules[].functions</code> 增加函数（<code>id / name / signature / does / calls</code>），
+    再把 <code>flows[].steps</code> 的 <code>fn</code> 指到这个 id。刷新本页即可。
+  </p>
+  <script>
+    const fnMap = {};
+    function byId(id) { return document.getElementById(id); }
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+    }
+
+    function render(data) {
+      byId("title").textContent = data.title;
+      byId("subtitle").textContent = data.subtitle;
+      data.modules.forEach((mod) => (mod.functions || []).forEach((fn) => { fnMap[fn.id] = fn; }));
+      byId("flows").innerHTML = data.flows.map((flow, i) =>
+        `<button class="flow-btn${i === 0 ? " active" : ""}" data-id="${esc(flow.id)}">${esc(flow.method)} ${esc(flow.path)}</button>`
+      ).join("");
+      byId("modules").innerHTML = data.modules.map((mod) => `
+        <section class="panel mod" style="border-top: 3px solid ${esc(mod.color)}">
+          <div class="mod-head">
+            <div>
+              <div class="mod-title">模块 ${esc(mod.level)} · ${esc(mod.name)}</div>
+            </div>
+            <div class="mod-file">${esc(mod.file)}</div>
+          </div>
+          <div class="fns">
+            ${(mod.functions || []).map((fn) => `
+              <article class="fn ${esc(fn.kind || "")}" data-fn="${esc(fn.id)}">
+                <h3 class="fn-name">${esc(fn.name)}</h3>
+                <div class="sig">${esc(fn.signature || "")}</div>
+                <p class="does">${esc(fn.does || "")}</p>
+                ${fn.calls && fn.calls.length ? `<ul class="calls">${fn.calls.map((c) => `<li>${esc(fnMap[c] ? fnMap[c].name : c)}</li>`).join("")}</ul>` : ""}
+              </article>
+            `).join("")}
+          </div>
+        </section>
+      `).join("");
+      selectFlow(data, data.flows[0].id);
+      document.querySelectorAll(".flow-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.querySelectorAll(".flow-btn").forEach((x) => x.classList.remove("active"));
+          btn.classList.add("active");
+          selectFlow(data, btn.dataset.id);
+        });
+      });
+    }
+
+    function selectFlow(data, flowId) {
+      const flow = data.flows.find((f) => f.id === flowId);
+      byId("meta").innerHTML = `
+        <div><b>接口</b>${esc(flow.method)} ${esc(flow.path)}</div>
+        <div><b>允许角色</b>${esc(flow.allowedRoles.join(" / "))}</div>
+        <div><b>响应</b>${esc(flow.response)}</div>
+        <div><b>怎么看左侧</b>黄字=哪一层；标题=第几步干什么；蓝字=函数名；绿字=下一步去哪。点一步会滚到右侧对应卡片。</div>
+      `;
+      byId("steps").innerHTML = flow.steps.map((step, i) => {
+        const fn = fnMap[step.fn];
+        const title = step.title || `${i + 1}. ${fn ? fn.name : step.fn}`;
+        const doing = step.do || step.label || "";
+        return `
+          <div class="step ${step.kind === "reject" ? "reject" : ""}" data-fn="${esc(step.fn)}">
+            <div class="num">${i + 1}</div>
+            <div>
+              <div class="step-layer">${esc(step.layer || "")}</div>
+              <div class="step-title">${esc(title)}</div>
+              <div class="step-fn">${esc(fn ? fn.name : step.fn)}</div>
+              <div class="step-do">${esc(doing)}</div>
+              ${step.then ? `<div class="step-then">下一步 → ${esc(step.then)}</div>` : ""}
+            </div>
+          </div>`;
+      }).join("");
+      const used = [...new Set(flow.steps.map((s) => s.fn))];
+      highlight(used);
+      document.querySelectorAll(".step").forEach((el) => {
+        el.addEventListener("mouseenter", () => highlight([el.dataset.fn], el));
+        el.addEventListener("click", () => {
+          const card = document.querySelector(`[data-fn="${CSS.escape(el.dataset.fn)}"].fn`);
+          if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+        el.addEventListener("mouseleave", () => highlight(used));
+      });
+    }
+
+    function highlight(ids, stepEl) {
+      document.querySelectorAll(".fn.active, .step.active").forEach((el) => el.classList.remove("active"));
+      ids.forEach((id) => {
+        document.querySelectorAll(`[data-fn="${CSS.escape(id)}"]`).forEach((el) => el.classList.add("active"));
+      });
+      if (stepEl) stepEl.classList.add("active");
+    }
+
+    fetch("./flow-data.json?t=" + Date.now())
+      .then((res) => res.json())
+      .then(render)
+      .catch((err) => { byId("subtitle").textContent = "加载 flow-data.json 失败：" + err; });
+  </script>
+</body>
+</html>

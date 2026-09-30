@@ -1,0 +1,14 @@
+*
+!.gitignore
+!anrf0911/
+!anrf0911/**
+!anrf0911-ai_service/
+!anrf0911-ai_service/**
+
+.env
+**/.env
+**/.env.*
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+anrf0911/generate/
