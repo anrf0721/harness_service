@@ -1,0 +1,10 @@
+# AutoDL 镜像里已有 CUDA 版 torch 时，不要重装 torch。
+unsloth
+trl>=0.15
+datasets
+peft
+transformers
+accelerate
+bitsandbytes
+fastapi
+uvicorn

@@ -11,4 +11,4 @@
 **/__pycache__/
 **/*.py[cod]
 **/.pytest_cache/
-anrf0911/generate/
+generate/

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_provider: str = "openai"
     llm_timeout_seconds: int = 60
+    # LLM_PROVIDER=local 时，ChatOpenAI 改打训练后的本地 OpenAI 兼容接口。
+    local_model_base_url: str = "http://127.0.0.1:8003/v1"
+    local_served_model: str = "customer-support-grpo"
     history_message_limit: int = 30
     history_character_budget: int = 12000
     cors_origins: list[str] = [

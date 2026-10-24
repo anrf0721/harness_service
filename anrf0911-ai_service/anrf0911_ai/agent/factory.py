@@ -20,6 +20,14 @@ from anrf0911_ai.common.config import get_settings
 
 def create_model():
     settings = get_settings()
+    if settings.llm_provider == "local":
+        return ChatOpenAI(
+            model=settings.local_served_model,
+            api_key=settings.llm_api_key or "local",
+            base_url=settings.local_model_base_url,
+            timeout=settings.llm_timeout_seconds,
+            temperature=0,
+        )
     return ChatOpenAI(
         model=settings.llm_model,
         api_key=settings.llm_api_key,
